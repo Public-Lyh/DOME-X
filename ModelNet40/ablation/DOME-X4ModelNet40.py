@@ -5,6 +5,7 @@ This runner intentionally does not reuse the legacy IKUN test-oracle paths in
 posteriors, while ModelNet40 test labels are consumed only for final reports.
 """
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -29,7 +30,14 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import DataLoader
 
 
-PROJECT_ROOT = Path("your path") / "Code" / "ModelNet40"
+PLACEHOLDER_ROOT = Path("your path")
+WORKSPACE_ROOT = Path(os.environ.get("DOME_X_PROJECT_ROOT", "your path")).expanduser()
+if not WORKSPACE_ROOT.exists():
+    WORKSPACE_ROOT = next(
+        (parent for parent in Path(__file__).resolve().parents if (parent / "Code").is_dir()),
+        PLACEHOLDER_ROOT,
+    )
+PROJECT_ROOT = WORKSPACE_ROOT / "Code" / "ModelNet40"
 SOURCE_PATH = PROJECT_ROOT / "DOME-X4ModelNet40-clcp.py"
 BASE_CKPT_DIR = PROJECT_ROOT / "checkpoints"
 BASE_LOG_DIR = PROJECT_ROOT / "logs"
@@ -82,6 +90,8 @@ RCF_VARIANTS = {
 
 def load_source():
     spec = importlib.util.spec_from_file_location("modelnet40_dome_source", SOURCE_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load the ModelNet40 source: {SOURCE_PATH}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -203,9 +213,9 @@ def metrics(labels, proba):
         class_ece.append(ece((labels == klass).astype(np.int64), binary))
     return {
         "acc": float(accuracy_score(labels, prediction)),
-        "f1": float(f1_score(labels, prediction, average="macro", zero_division=0)),
-        "precision": float(precision_score(labels, prediction, average="macro", zero_division=0)),
-        "recall": float(recall_score(labels, prediction, average="macro", zero_division=0)),
+        "f1": float(f1_score(labels, prediction, average="macro", zero_division="warn")),
+        "precision": float(precision_score(labels, prediction, average="macro", zero_division="warn")),
+        "recall": float(recall_score(labels, prediction, average="macro", zero_division="warn")),
         "ece": ece(labels, proba), "adaptive_ece": ece(labels, proba, adaptive=True),
         "classwise_ece": float(np.mean(class_ece)),
         "brier": float(np.square(proba - one_hot).sum(1).mean()),
@@ -462,6 +472,8 @@ def train_rost_models(models, specs, pcs, normals, views, labels, fit_idx, profi
     history = []
     snapshots = {}
     stale = 0
+    current_profile = profile(ema)
+    weights = controller_weights(current_profile, config, 1)
     for epoch in range(1, ROST_EPOCHS + 1):
         if epoch == 1 or epoch % PROFILE_INTERVAL == 0:
             current = [soft_confusion(labels[profile_idx], predict_expert(models[name], pcs, normals, views, profile_idx, specs[name][1])) for name in names]
@@ -574,7 +586,7 @@ def semantic_initialization_fold(seed, fold, specs, train, labels, root, tag):
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    artifact = {"tag": tag, "seed": seed, "fold": fold, "fit_idx": fit_idx.astype(np.int64), "profile_idx": profile_idx.astype(np.int64), "holdout_idx": holdout.astype(np.int64), "states": states, "histories": histories, "profile_matrices": matrices}
+    artifact = {"tag": tag, "seed": seed, "fold": fold, "fit_idx": np.asarray(fit_idx, dtype=np.int64), "profile_idx": np.asarray(profile_idx, dtype=np.int64), "holdout_idx": np.asarray(holdout, dtype=np.int64), "states": states, "histories": histories, "profile_matrices": matrices}
     torch.save(artifact, path)
     return artifact
 
@@ -595,7 +607,7 @@ def expert_fold(variant, config, seed, fold, specs, train, test, labels, root, t
         models[name] = model
     print(f"{variant} seed={seed} fold={fold}/{OUTER_FOLDS}: controller-driven ROST")
     models, probe, rost_history, rost_epoch, rost_snapshots = train_rost_models(models, specs, pcs, normals, views, labels, fit_idx, profile_idx, config, seed + fold * 1000, fold)
-    output = {"tag": tag, "variant": variant, "seed": seed, "fold": fold, "holdout_idx": holdout.astype(np.int64), "holdout": {}, "test": {}, "profile_idx": profile_idx.astype(np.int64), "semantic_initialization": {"path": str(root / "semantic_initialization" / f"shared_s{seed}_f{fold}.pt"), "histories": initialization["histories"]}, "rost_history": rost_history, "rost_epoch": rost_epoch, "probe_state": probe.state_dict()}
+    output = {"tag": tag, "variant": variant, "seed": seed, "fold": fold, "holdout_idx": np.asarray(holdout, dtype=np.int64), "holdout": {}, "test": {}, "profile_idx": np.asarray(profile_idx, dtype=np.int64), "semantic_initialization": {"path": str(root / "semantic_initialization" / f"shared_s{seed}_f{fold}.pt"), "histories": initialization["histories"]}, "rost_history": rost_history, "rost_epoch": rost_epoch, "probe_state": probe.state_dict()}
     profile_posteriors = []
     test_indices = np.arange(len(test_pcs))
     for name, (_, kind) in specs.items():
@@ -661,12 +673,14 @@ class ComponentRCF(nn.Module):
         context_dim = self.modalities * NC * 3 + self.modalities * 4
         width = max(96, 2 * NC)
         self.path_logits = nn.Parameter(torch.tensor([0.35, 0.30, 0.20, 0.15], dtype=torch.float32))
-        self.gate = nn.Sequential(nn.Linear(context_dim, width), nn.LayerNorm(width), nn.GELU(), nn.Linear(width, 1))
-        self.residual = nn.Sequential(nn.Linear(context_dim, width), nn.LayerNorm(width), nn.GELU(), nn.Linear(width, NC))
-        nn.init.zeros_(self.gate[-1].weight)
-        nn.init.constant_(self.gate[-1].bias, -3.0)
-        nn.init.zeros_(self.residual[-1].weight)
-        nn.init.zeros_(self.residual[-1].bias)
+        gate_output = nn.Linear(width, 1)
+        residual_output = nn.Linear(width, NC)
+        self.gate = nn.Sequential(nn.Linear(context_dim, width), nn.LayerNorm(width), nn.GELU(), gate_output)
+        self.residual = nn.Sequential(nn.Linear(context_dim, width), nn.LayerNorm(width), nn.GELU(), residual_output)
+        nn.init.zeros_(gate_output.weight)
+        nn.init.constant_(gate_output.bias, -3.0)
+        nn.init.zeros_(residual_output.weight)
+        nn.init.zeros_(residual_output.bias)
 
     def enabled_parameters(self):
         enable = {
@@ -988,7 +1002,6 @@ def main():
                 summary_rows.append(row)
                 prediction_cache[f"ROST|{variant}|ps{seed}|fs{fusion_seed}"] = output.astype(np.float32)
                 plot_cm(test_labels, output, log / f"cm_rost_{slug(variant)}_ps{seed}_fs{fusion_seed}.png", f"ROST {variant} | Full RCF", categories)
-            diagnostics = profile(matrices)
             profile_snapshots[f"{slug(variant)}_s{seed}"] = {
                 "oof": [soft_confusion(labels, x[:, modality]) for modality in range(x.shape[1])],
                 "fold_profiles": data["profiles"],
@@ -1064,21 +1077,47 @@ def main():
     np.savez_compressed(root / "final_seed_predictions.npz", test_labels=test_labels, **prediction_cache)
     save_json(profile_snapshots, log / "profile_snapshots.json")
     save_json({"manifest": manifest, "rost_rows": summary_rows, "rcf_rows": rcf_rows, "paired_bootstrap": bootstrap}, log / "results.json")
-    rost_rank = summary_frame.groupby("variant")[["acc", "f1", "ece", "brier", "nll", "jsri", "disagreement_acc", "low_confidence_acc", "recoverable_error_acc", "hard_class_acc"]].mean().sort_values(["acc", "f1"], ascending=False).reset_index()
-    rcf_rank = rcf_frame.groupby("variant")[["acc", "f1", "ece", "brier", "nll", "disagreement_acc", "low_confidence_acc", "recoverable_error_acc", "hard_class_acc", "parameters"]].mean().sort_values(["acc", "f1"], ascending=False).reset_index() if not rcf_frame.empty else pd.DataFrame()
+    rost_rank = summary_frame.groupby("variant")[["acc", "f1", "ece", "brier", "nll", "jsri", "disagreement_acc", "low_confidence_acc", "recoverable_error_acc", "hard_class_acc"]].mean().sort_values(["acc", "f1"], ascending=False).reset_index()  # pyright: ignore[reportCallIssue]
+    rcf_rank = rcf_frame.groupby("variant")[["acc", "f1", "ece", "brier", "nll", "disagreement_acc", "low_confidence_acc", "recoverable_error_acc", "hard_class_acc", "parameters"]].mean().sort_values(["acc", "f1"], ascending=False).reset_index() if not rcf_frame.empty else pd.DataFrame()  # pyright: ignore[reportCallIssue]
     print("ROST ablation under Full RCF")
     print("rank | variant | acc | f1 | nll | JSRI | disagree_acc | low_conf_acc | recoverable_acc | hard_class_acc")
-    for rank, row in rost_rank.iterrows():
-        print(f"{rank + 1:>4} | {row['variant']:<32.32} | {row['acc']:.4f} | {row['f1']:.4f} | {row['nll']:.4f} | {row['jsri']:.4f} | {row['disagreement_acc']:.4f} | {row['low_confidence_acc']:.4f} | {row['recoverable_error_acc']:.4f} | {row['hard_class_acc']:.4f}")
+    for rank, (_, row) in enumerate(rost_rank.iterrows(), start=1):
+        print(f"{rank:>4} | {row['variant']:<32.32} | {row['acc']:.4f} | {row['f1']:.4f} | {row['nll']:.4f} | {row['jsri']:.4f} | {row['disagreement_acc']:.4f} | {row['low_confidence_acc']:.4f} | {row['recoverable_error_acc']:.4f} | {row['hard_class_acc']:.4f}")
     print("RCF component ablation with Full ROST experts")
     print("rank | variant | acc | f1 | nll | disagree_acc | low_conf_acc | recoverable_acc | hard_class_acc | params")
-    for rank, row in rcf_rank.iterrows():
-        print(f"{rank + 1:>4} | {row['variant']:<32.32} | {row['acc']:.4f} | {row['f1']:.4f} | {row['nll']:.4f} | {row['disagreement_acc']:.4f} | {row['low_confidence_acc']:.4f} | {row['recoverable_error_acc']:.4f} | {row['hard_class_acc']:.4f} | {int(row['parameters'])}")
+    for rank, (_, row) in enumerate(rcf_rank.iterrows(), start=1):
+        print(f"{rank:>4} | {row['variant']:<32.32} | {row['acc']:.4f} | {row['f1']:.4f} | {row['nll']:.4f} | {row['disagreement_acc']:.4f} | {row['low_confidence_acc']:.4f} | {row['recoverable_error_acc']:.4f} | {row['hard_class_acc']:.4f} | {int(row['parameters'])}")
     print("ModelNet40 DOME-X ROST/RCF ablation complete")
     print(f"Checkpoints={root}")
     print(f"Logs={log}")
     print(f"TimeMinutes={(time.time() - started) / 60.0:.1f}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="validate dependencies and cached inputs")
+    return parser.parse_args()
+
+
+def check_environment():
+    required_api = ("MVDataset", "PCDataset", "PointNetPP", "DGCNN", "MVCNN")
+    missing = [name for name in required_api if not hasattr(SRC, name)]
+    if missing:
+        raise RuntimeError(f"ModelNet40 source is missing definitions: {missing}")
+    cache_path = PROJECT_ROOT / "cache" / f"modelnet40_np{SRC.N_POINTS}_views{SRC.N_VIEWS}_size{SRC.VIEW_SIZE}.pkl"
+    if not SOURCE_PATH.is_file():
+        raise FileNotFoundError(f"Missing ModelNet40 source: {SOURCE_PATH}")
+    if not SRC.DATA_ROOT.is_dir() and not cache_path.is_file():
+        raise FileNotFoundError("ModelNet40 data and preprocessing cache are both missing")
+    print(
+        f"ModelNet40 ablation check passed: source={SOURCE_PATH.name} "
+        f"data={SRC.DATA_ROOT.is_dir()} cache={cache_path.is_file()}"
+    )
+
+
 if __name__ == "__main__":
-    main()
+    arguments = parse_args()
+    if arguments.check:
+        check_environment()
+    else:
+        main()
