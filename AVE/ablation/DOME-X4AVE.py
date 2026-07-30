@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import os
@@ -19,7 +20,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-ROOT = Path("your path") / "Code" / "AVE"
+PLACEHOLDER_ROOT = Path("your path")
+WORKSPACE_ROOT = Path(os.environ.get("DOME_X_PROJECT_ROOT", "your path")).expanduser()
+if not WORKSPACE_ROOT.exists():
+    WORKSPACE_ROOT = next(
+        (parent for parent in Path(__file__).resolve().parents if (parent / "Code").is_dir()),
+        PLACEHOLDER_ROOT,
+    )
+ROOT = WORKSPACE_ROOT / "Code" / "AVE"
 REFERENCE_DIR = ROOT / "checkpoints" / "v1" / "DOME_X_AVE_CE_ROST"
 CHECKPOINT_ROOT = ROOT / "checkpoints"
 LOG_ROOT = ROOT / "logs"
@@ -107,9 +115,9 @@ def metric_dict(labels, probs):
             ece += float(mask.mean() * abs((pred[mask] == labels[mask]).mean() - confidence[mask].mean()))
     return {
         "acc": float(accuracy_score(labels, pred)),
-        "f1": float(f1_score(labels, pred, average="macro", zero_division=0)),
-        "precision": float(precision_score(labels, pred, average="macro", zero_division=0)),
-        "recall": float(recall_score(labels, pred, average="macro", zero_division=0)),
+        "f1": float(f1_score(labels, pred, average="macro", zero_division="warn")),
+        "precision": float(precision_score(labels, pred, average="macro", zero_division="warn")),
+        "recall": float(recall_score(labels, pred, average="macro", zero_division="warn")),
         "ece": ece,
         "brier": float(np.square(probs - onehot).sum(1).mean()),
         "nll": float(log_loss(labels, probs, labels=np.arange(NC))),
@@ -162,12 +170,14 @@ class ReferenceRCF(nn.Module):
         self.scale = nn.Parameter(torch.ones(2, NC))
         self.bias = nn.Parameter(torch.zeros(2, NC))
         self.path = nn.Parameter(torch.log(torch.tensor([0.20, 0.25, 0.20, 0.10, 0.25])))
-        self.path_gate = nn.Sequential(nn.Linear(5 * NC + 6, 64), nn.GELU(), nn.Linear(64, 5))
+        path_output = nn.Linear(64, 5)
+        residual_output = nn.Linear(64, NC, bias=False)
+        self.path_gate = nn.Sequential(nn.Linear(5 * NC + 6, 64), nn.GELU(), path_output)
         self.gate = nn.Sequential(nn.Linear(5 * NC + 6, 64), nn.GELU(), nn.Linear(64, 1))
-        self.residual = nn.Sequential(nn.Linear(5 * NC + 6, 64), nn.GELU(), nn.Linear(64, NC, bias=False))
-        nn.init.zeros_(self.path_gate[-1].weight)
-        nn.init.zeros_(self.path_gate[-1].bias)
-        nn.init.zeros_(self.residual[-1].weight)
+        self.residual = nn.Sequential(nn.Linear(5 * NC + 6, 64), nn.GELU(), residual_output)
+        nn.init.zeros_(path_output.weight)
+        nn.init.zeros_(path_output.bias)
+        nn.init.zeros_(residual_output.weight)
 
     def forward(self, x):
         x = x.clamp_min(EPS)
@@ -425,5 +435,28 @@ def main():
     print(f"TimeMinutes={(time.time() - start) / 60.0:.2f}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run AVE RCF component ablations.")
+    parser.add_argument("--check", action="store_true", help="validate reference artifacts")
+    return parser.parse_args()
+
+
+def check_environment():
+    missing = [path for path in (POSTERIOR_FILE, FULL_CHECKPOINT) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing AVE ablation artifacts: {missing}")
+    with np.load(POSTERIOR_FILE, allow_pickle=False) as archive:
+        if "labels" not in archive.files or "test_labels" not in archive.files:
+            raise KeyError("AVE posterior artifact is missing labels")
+        print(
+            f"AVE ablation check passed: development={len(archive['labels'])} "
+            f"test={len(archive['test_labels'])} checkpoint={FULL_CHECKPOINT.name}"
+        )
+
+
 if __name__ == "__main__":
-    main()
+    arguments = parse_args()
+    if arguments.check:
+        check_environment()
+    else:
+        main()
